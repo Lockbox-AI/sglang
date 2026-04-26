@@ -8,6 +8,13 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip
 
+
+def _is_sm120() -> bool:
+    from sglang.srt.layers.attention.sm_120 import is_sm120
+
+    return is_sm120()
+
+
 if TYPE_CHECKING:
     from flash_mla.flash_mla_interface import FlashMLASchedMeta
 
@@ -124,6 +131,27 @@ class PagedIndexerMetadata(IndexerMetadata):
     def __post_init__(self):
         if envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
             self.deep_gemm_metadata = None
+        elif _is_sm120():
+            # feat/sm_120-paged-mqa-logits: DeepGEMM has no sm_120 implementation
+            # of get_paged_mqa_logits_metadata (csrc/apis/attention.hpp:215).
+            # Use the pure-Python port; the downstream logits call is routed to
+            # the in-tree TileLang kernel via sm_120/indexer.py.
+            # Refs: sgl-project/sglang#23657, deepseek-ai/DeepGEMM#236.
+            from sglang.srt.layers.attention.sm_120 import (
+                get_paged_mqa_logits_metadata_python,
+            )
+
+            _c4 = self.c4_seq_lens.to(torch.int32)
+            if _c4.dim() == 1:
+                _c4 = _c4.unsqueeze(-1)
+            num_sms = torch.cuda.get_device_properties(
+                _c4.device if _c4.is_cuda else 0
+            ).multi_processor_count
+            self.deep_gemm_metadata = get_paged_mqa_logits_metadata_python(
+                _c4,
+                self.c4_page_size,
+                num_sms,
+            )
         else:
             import deep_gemm
 
@@ -252,8 +280,6 @@ class PagedCoreMetadata(CoreMetadata):
                 "c128_flashmla_metadata",
             ],
         )
-
-
 
 
 @dataclass

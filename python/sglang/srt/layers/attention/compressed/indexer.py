@@ -372,7 +372,17 @@ class C4IndexerBackend:
         )
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
-        if envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
+        from sglang.srt.layers.attention.sm_120 import is_sm120
+
+        if is_sm120():
+            # feat/sm_120-paged-mqa-logits: DeepGEMM's fp8_paged_mqa_logits is
+            # unavailable on sm_120 (csrc/apis/attention.hpp:215). Route through
+            # the in-tree TileLang kernel via a shape-adapter shim.
+            # Refs: sgl-project/sglang#23657, deepseek-ai/DeepGEMM#236.
+            from sglang.srt.layers.attention.sm_120 import (
+                tilelang_fp8_paged_mqa_logits_sm120 as fn,
+            )
+        elif envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
             from sglang.srt.layers.attention.nsa.tilelang_kernel import (
                 tilelang_fp8_paged_mqa_logits as fn,
             )
