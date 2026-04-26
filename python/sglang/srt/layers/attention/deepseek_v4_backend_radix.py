@@ -1104,7 +1104,36 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
             )
 
             backend = envs.SGLANG_HACK_FLASHMLA_BACKEND.get()
-            o = flash_mla_with_kvcache_entrypoint(**input_dict, backend=backend)[0]
+            # poc-16 T2A.3: on sm_120 (RTX Pro 6000 / RTX 5090) FlashMLA's
+            # sparse_decode_fwd is unavailable. The arch check at
+            # csrc/api/sparse_decode.h:380 raises
+            #     RuntimeError: Unsupported architecture for sparse decode fwd
+            # before any kernel runs. The TileLang re-implementation in
+            # sglang.srt.layers.attention.sm_120.tilelang_sparse_decode
+            # (T2A.3 K2a) replaces both the per-SM-part decode kernel
+            # (csrc/sm90/decode/sparse_fp8/splitkv_mla.cuh) and — since the
+            # split-KV combine kernel is launched from inside the same
+            # arch-gated entry point and is therefore inaccessible on sm_120
+            # even though combine.cu itself is portable — the combine
+            # (currently single-shot, see triton_combine_partials_sm120
+            # for the planned post-split-KV semantics).
+            #
+            # Mirrors T2A.1's pattern at compressed/metadata.py:142 /
+            # compressed/indexer.py:381 (DeepGEMM bypass).
+            #
+            # Refs: T1.3-sparse-decode-fwd-spec.md §3, §6, §8.3;
+            #       T2A.3-INTEGRATION-STATUS.md;
+            #       sgl-project/sglang#23657 (parallel issue for K1a).
+            from sglang.srt.layers.attention.sm_120 import is_sm120
+
+            if is_sm120():
+                from sglang.srt.layers.attention.sm_120 import (
+                    tilelang_fp8_sparse_decode_sm120,
+                )
+
+                o = tilelang_fp8_sparse_decode_sm120(**input_dict)[0]
+            else:
+                o = flash_mla_with_kvcache_entrypoint(**input_dict, backend=backend)[0]
 
             o = o.squeeze(1)
             return o

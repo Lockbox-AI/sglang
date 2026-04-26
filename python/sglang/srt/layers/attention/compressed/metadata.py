@@ -122,8 +122,33 @@ class PagedIndexerMetadata(IndexerMetadata):
     topk_metadata: torch.Tensor = field(init=False, repr=False)
 
     def __post_init__(self):
+        # poc-16 T2A.1: on sm_120 (RTX Pro 6000 / RTX 5090) DeepGEMM has no
+        # paged_mqa_logits kernel and asserts at csrc/apis/attention.hpp:215
+        # ("only sm_90 / sm_100 supported"). We bypass deep_gemm entirely
+        # for this metadata helper and call a pure-Python port of the
+        # scheduler instead. The downstream FP8 paged MQA logits call is
+        # routed to the in-tree TileLang kernel in compressed/indexer.py.
+        # Refs: sgl-project/sglang#23657, deepseek-ai/DeepGEMM#236.
+        from sglang.srt.layers.attention.sm_120 import (
+            get_paged_mqa_logits_metadata_python,
+            is_sm120,
+        )
+
         if envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
             self.deep_gemm_metadata = None
+        elif is_sm120():
+            _c4 = self.c4_seq_lens.to(torch.int32)
+            if _c4.dim() == 1:
+                _c4 = _c4.unsqueeze(-1)
+            num_sms = torch.cuda.get_device_properties(
+                _c4.device if _c4.is_cuda else 0
+            ).multi_processor_count
+            self.deep_gemm_metadata = get_paged_mqa_logits_metadata_python(
+                _c4,
+                self.c4_page_size,
+                num_sms,
+            )
+            assert isinstance(self.deep_gemm_metadata, torch.Tensor)
         else:
             import deep_gemm
 
@@ -252,8 +277,6 @@ class PagedCoreMetadata(CoreMetadata):
                 "c128_flashmla_metadata",
             ],
         )
-
-
 
 
 @dataclass
