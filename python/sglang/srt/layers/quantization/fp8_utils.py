@@ -164,8 +164,40 @@ class Fp8GemmRunnerBackend(Enum):
 FP8_GEMM_RUNNER_BACKEND: Fp8GemmRunnerBackend | None = None
 
 
+def _is_sm120() -> bool:
+    """Return True iff running on a NVIDIA Blackwell consumer/workstation GPU
+    (compute capability 12.0, e.g. RTX PRO 6000 / RTX 5090).
+
+    poc-16 Phase 4 / T4.1: cutlass W8A8 block FP8 GEMM, flashinfer_trtllm,
+    and DeepGEMM JIT all fail on sm_120 (silent corruption / explicit
+    capability assertion / NVCC compile error respectively). Triton is the
+    only working FP8 W8A8 block linear backend on sm_120 today. We use this
+    helper to gate dispatch to triton on sm_120, until upstream lands sm_120
+    support for the other backends.
+
+    Refs: sgl-project/sglang#23657, T4.1-FP8-BACKEND-BISECTION-STATUS.md.
+    """
+    if not torch.cuda.is_available():
+        return False
+    try:
+        return torch.cuda.get_device_capability(0) == (12, 0)
+    except Exception:
+        return False
+
+
 def _check_cutlass_block_fp8_hardware_support() -> bool:
-    """Return True if CUTLASS block FP8 is supported (Hopper or newer with CUDA 12.0+)."""
+    """Return True if CUTLASS block FP8 is supported (Hopper or newer with CUDA 12.0+).
+
+    poc-16 Phase 4 / T4.1: sm_120 (Blackwell consumer / RTX PRO 6000) is
+    explicitly excluded — `is_blackwell_supported()` evaluates True for
+    cap 12.0, but the actual cutlass W8A8 block kernel ships an sm_90 /
+    sm_100 schedule that produces silent numerical corruption when run on
+    sm_120 hardware (no NaN, no error — just wrong values that compound
+    across V4-Flash's 64 attention layers and produce garbled multi-lingual
+    output). Routing sm_120 to triton restores coherent V4-Flash inference.
+    """
+    if _is_sm120():
+        return False
     return is_sm90_supported() or is_blackwell_supported()
 
 
@@ -191,9 +223,27 @@ def dispatch_w8a8_block_fp8_linear() -> Callable:
     return _dispatch_auto_backend()
 
 
+_SM120_BACKEND_ERROR = (
+    "{backend} FP8 GEMM was requested via --fp8-gemm-backend={flag}, but it is "
+    "known to {failure_mode} on sm_120 (RTX PRO 6000 Blackwell / RTX 5090, "
+    "compute capability 12.0). Use --fp8-gemm-backend=triton instead — that is "
+    "the only FP8 W8A8 block GEMM backend that produces correct output on "
+    "sm_120 today (poc-16 Phase 4 T4.1, sgl-project/sglang#23657)."
+)
+
+
 def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
     """Dispatch based on explicitly selected backend."""
     if backend.is_flashinfer():
+        if _is_sm120():
+            raise RuntimeError(
+                _SM120_BACKEND_ERROR.format(
+                    backend="FlashInfer TRTLLM",
+                    flag="flashinfer_trtllm",
+                    failure_mode="raise an explicit BackendSupportedError "
+                    '("capability 120 not supported")',
+                )
+            )
         if not (is_blackwell_supported() and is_flashinfer_available()):
             raise RuntimeError(
                 "FlashInfer FP8 GEMM requested via --fp8-gemm-backend=flashinfer_trtllm, "
@@ -203,6 +253,16 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
         return flashinfer_gemm_w8a8_block_fp8_linear_with_fallback
 
     elif backend.is_cutlass():
+        if _is_sm120():
+            raise RuntimeError(
+                _SM120_BACKEND_ERROR.format(
+                    backend="CUTLASS block",
+                    flag="cutlass",
+                    failure_mode="silently produce garbled / corrupted output "
+                    "(no NaN, no assertion — just wrong values that compound "
+                    "across V4 attention layers)",
+                )
+            )
         if not _check_cutlass_block_fp8_hardware_support():
             raise RuntimeError(
                 "CUTLASS block FP8 requested via --fp8-gemm-backend=cutlass, "
@@ -221,6 +281,16 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
         return aiter_w8a8_block_fp8_linear
 
     elif backend.is_deep_gemm():
+        if _is_sm120():
+            raise RuntimeError(
+                _SM120_BACKEND_ERROR.format(
+                    backend="DeepGEMM JIT",
+                    flag="deep_gemm",
+                    failure_mode="fail at JIT time with NVCC compilation errors "
+                    '("jit/compiler.hpp:228: false and \\"NVCC compilation '
+                    'failed\\"")',
+                )
+            )
         if not deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
             raise RuntimeError(
                 "DeepGEMM backend requested via --fp8-gemm-backend=deep_gemm, "
@@ -239,12 +309,19 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
 def _dispatch_auto_backend() -> Callable:
     """Auto-select the best backend based on hardware capabilities."""
     # Priority order for auto selection:
-    # 1. DeepGEMM (if enabled and available)
-    # 2. FlashInfer TRTLLM (if Blackwell GPU and FlashInfer available)
-    # 3. CUTLASS (if Hopper+ GPU and CUDA 12.0+)
-    # 4. AITER (if AMD GPU with AITER enabled)
-    # 5. Triton (fallback)
+    # 1. sm_120 → Triton (the only working FP8 W8A8 backend on RTX PRO 6000 /
+    #    RTX 5090; see poc-16 Phase 4 T4.1 — DeepGEMM JIT compile-fails,
+    #    flashinfer_trtllm asserts "capability 120 not supported", and
+    #    cutlass silently corrupts. This must be the FIRST branch so
+    #    none of the other (broken) auto paths get picked first.)
+    # 2. DeepGEMM (if enabled and available)
+    # 3. FlashInfer TRTLLM (if Blackwell GPU and FlashInfer available)
+    # 4. CUTLASS (if Hopper+ GPU and CUDA 12.0+)
+    # 5. AITER (if AMD GPU with AITER enabled)
+    # 6. Triton (fallback)
 
+    if _is_sm120():
+        return triton_w8a8_block_fp8_linear
     if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
         return deepgemm_w8a8_block_fp8_linear_with_fallback
     elif is_blackwell_supported() and is_flashinfer_available():
