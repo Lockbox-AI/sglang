@@ -55,6 +55,49 @@ def _warn_once(key: str, msg: str) -> None:
         logger.warning(msg)
 
 
+_PROBE_ATTN_SINK_CALLS = 0
+_PROBE_ATTN_SINK_LIMIT = 4
+
+
+def _probe_log_attn_sink(attn_sink: torch.Tensor) -> None:
+    """Log per-head stats for the first ``_PROBE_ATTN_SINK_LIMIT`` sink
+    tensors that flow through ``tilelang_fp8_sparse_decode_sm120``.
+
+    Phase-5 / T5.2 diagnostic. The log line includes shape, dtype, mean,
+    abs-mean, min, max, and the first 16 head values. Throttled per
+    process to keep the server log clean even on long GSM8K runs.
+    """
+    global _PROBE_ATTN_SINK_CALLS
+    if _PROBE_ATTN_SINK_CALLS >= _PROBE_ATTN_SINK_LIMIT:
+        return
+    _PROBE_ATTN_SINK_CALLS += 1
+    try:
+        flat = attn_sink.detach().to(torch.float32).flatten()
+        n = flat.numel()
+        head = flat[: min(16, n)].cpu().tolist()
+        nan_count = int(torch.isnan(flat).sum().item())
+        inf_count = int(torch.isinf(flat).sum().item())
+        logger.warning(
+            "[sm_120 phase-5 T5.2 sink-probe %d/%d] shape=%s dtype=%s "
+            "n=%d mean=%.4f abs_mean=%.4f min=%.4f max=%.4f "
+            "nan=%d inf=%d head[:16]=%s",
+            _PROBE_ATTN_SINK_CALLS,
+            _PROBE_ATTN_SINK_LIMIT,
+            tuple(attn_sink.shape),
+            attn_sink.dtype,
+            n,
+            float(flat.mean().item()),
+            float(flat.abs().mean().item()),
+            float(flat.min().item()),
+            float(flat.max().item()),
+            nan_count,
+            inf_count,
+            [round(v, 4) for v in head],
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[sm_120 phase-5 T5.2 sink-probe] log failed: %r", e)
+
+
 # DeepGEMM pages the KV cache in ``SPLIT_KV``-token chunks.
 SPLIT_KV = 256
 
@@ -240,6 +283,18 @@ def tilelang_fp8_sparse_decode_sm120(
             "sm_120 sparse-decode: topk_length not yet supported; "
             "treating decode positions as fully attended within top-k window",
         )
+
+    # Phase-5 / T5.2 diagnostic probe: log the first N attn_sink tensors
+    # observed at this dispatch point (per TP rank) so we can localise the
+    # S1 residual to "fold math wrong" vs. "sink values themselves drifted
+    # on sm_120". Active only when SGLANG_SM120_PROBE_ATTN_SINK=1.
+    try:
+        from sglang.srt.layers.sm120_diagnostic import probe_attn_sink
+
+        if probe_attn_sink() and attn_sink is not None:
+            _probe_log_attn_sink(attn_sink)
+    except Exception:
+        pass
 
     from sglang.srt.layers.attention.sm_120.tilelang_sparse_decode import (
         tilelang_fp8_sparse_decode,

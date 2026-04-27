@@ -117,6 +117,26 @@ def eager_moe_fp8() -> bool:
 
 
 @functools.lru_cache(maxsize=1)
+def probe_attn_sink() -> bool:
+    """``True`` iff ``SGLANG_SM120_PROBE_ATTN_SINK`` is set (T5.2 sink probe).
+
+    When active, the K2a sparse-decode wrapper logs the first N
+    ``attn_sink`` tensors it sees (per TP rank), printing per-head
+    magnitudes and basic stats. Used to localise S1 to "fold math is
+    wrong" vs. "sink values themselves are drifted".
+    """
+    val = _truthy(os.environ.get("SGLANG_SM120_PROBE_ATTN_SINK"))
+    if val:
+        logger.warning(
+            "%s SGLANG_SM120_PROBE_ATTN_SINK=1 -> attn_sink tensors that "
+            "reach tilelang_fp8_sparse_decode_sm120 will be printed "
+            "(first 4 calls per process; throttled). Diagnostic only.",
+            _LOG_PREFIX,
+        )
+    return val
+
+
+@functools.lru_cache(maxsize=1)
 def eager_w8a8_block() -> bool:
     """``True`` iff ``SGLANG_SM120_EAGER_W8A8_BLOCK`` is set (S2 toggle)."""
     val = _truthy(os.environ.get("SGLANG_SM120_EAGER_W8A8_BLOCK"))
@@ -137,15 +157,17 @@ def any_active() -> bool:
         or eager_sparse_decode()
         or eager_moe_fp8()
         or eager_w8a8_block()
+        or probe_attn_sink()
     )
 
 
 def _clear_cache() -> None:
-    """Test hook: clear all four cached toggle reads after env mutation."""
+    """Test hook: clear cached toggle reads after env mutation."""
     disable_attn_sink.cache_clear()
     eager_sparse_decode.cache_clear()
     eager_moe_fp8.cache_clear()
     eager_w8a8_block.cache_clear()
+    probe_attn_sink.cache_clear()
 
 
 __all__ = [
@@ -153,5 +175,6 @@ __all__ = [
     "eager_sparse_decode",
     "eager_moe_fp8",
     "eager_w8a8_block",
+    "probe_attn_sink",
     "any_active",
 ]
