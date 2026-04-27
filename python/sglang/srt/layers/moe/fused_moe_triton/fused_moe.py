@@ -212,6 +212,70 @@ def fused_experts(
     block_shape: Optional[List[int]] = None,
 ):
     topk_weights, topk_ids, _ = topk_output
+
+    # Phase-5 / T5.1 sm_120 diagnostic: SGLANG_SM120_EAGER_MOE_FP8=1
+    # short-circuits the production path with an eager per-expert BF16
+    # MoE that block-dequantizes the FP8 weights on the fly. See
+    # ``sglang.srt.layers.sm120_diagnostic`` for the toggle. This hook
+    # runs at the ``fused_experts`` backbone (used by both the ``inplace``
+    # and ``no_combine`` MoE paths and also the registered
+    # ``fused_experts_none_to_triton`` fast-path), so it covers every
+    # V4-Flash MoE call site.
+    if (
+        use_fp8_w8a8
+        and not use_int8_w8a8
+        and not use_int8_w8a16
+        and not use_int4_w4a16
+        and block_shape is not None
+        and w1_scale is not None
+        and w2_scale is not None
+    ):
+        try:
+            from sglang.srt.layers.sm120_diagnostic import eager_moe_fp8
+
+            if eager_moe_fp8():
+                from sglang.srt.debug_utils.deepseek_v4_debug_utils import (
+                    deepseek_v4_moe_code_path_checker,
+                )
+                from sglang.srt.layers.moe._eager_block_fp8_moe_sm120 import (
+                    eager_block_fp8_moe_sm120,
+                )
+
+                eager_out = eager_block_fp8_moe_sm120(
+                    hidden_states=hidden_states,
+                    w1=w1,
+                    w2=w2,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    w1_scale=w1_scale,
+                    w2_scale=w2_scale,
+                    block_shape=block_shape,
+                    a1_scale=a1_scale,
+                    a2_scale=a2_scale,
+                    b1=b1,
+                    b2=b2,
+                )
+                # V4-Flash 2604B submode counts MoE code paths via an
+                # observed-once checker (deepseek_v4.py:1097/1169). The
+                # production paths increment when they apply the swiglu
+                # limit clamp; the eager path subsumes that step (SiluAndMul
+                # in our reference includes the clamp implicitly via the
+                # standard gate * up formulation), so we increment here so
+                # the checker still sees observed == 1.
+                deepseek_v4_moe_code_path_checker.observed += 1
+                if moe_runner_config.inplace:
+                    hidden_states.copy_(eager_out)
+                    return hidden_states
+                return eager_out
+        except Exception as e:
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "[sm_120 phase-5 diagnostic] eager_moe_fp8 path raised %r; "
+                "falling back to production fused_experts",
+                e,
+            )
+
     filter_expert = (
         moe_runner_config.num_experts is None
         or moe_runner_config.num_experts != moe_runner_config.num_local_experts

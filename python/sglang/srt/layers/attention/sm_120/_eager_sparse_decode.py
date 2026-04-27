@@ -182,70 +182,89 @@ def eager_fp8_sparse_decode(
     num_pages, page_size, _h, _bpt = kv_cache.shape
     topk = indices.shape[-1]
 
+    # Memory-bounded path. Production prefill shapes can have B*S_q up
+    # to ~8K with topk=2K, which would be a multi-GB per-rank working
+    # set if we materialized the full ``[B, S_q, topk, D]`` slice. We
+    # chunk over the (B*S_q) axis with CHUNK=32 so the per-chunk
+    # working set is bounded at a few hundred MB even in the worst case.
     kv_fp8, kv_rope, kv_scales = _decode_kv_v4(kv_cache)
-    kv_nope_bf16 = _dequant_nope_to_bf16(kv_fp8, kv_scales)
-    # Use ``.reshape`` (not ``.view``) because the underlying tensors are
-    # sliced from the region-A buffer with non-contiguous outer strides
-    # (only the last dim is unit-stride). ``.reshape`` falls back to a
-    # copy when needed; for the diagnostic path we prefer correctness over
-    # zero-copy.
-    flat_nope = kv_nope_bf16.reshape(num_pages * page_size, _V4_D_NOPE)
+    flat_fp8 = kv_fp8.reshape(num_pages * page_size, _V4_D_NOPE)
     flat_rope = kv_rope.reshape(num_pages * page_size, _V4_D_ROPE)
+    flat_scales = kv_scales.reshape(num_pages * page_size, _V4_NUM_SCALES)
 
-    safe_idx = indices.clamp(min=0).long()  # [B, S_q, topk]
-    valid_mask = indices >= 0  # [B, S_q, topk]
+    safe_idx = indices.clamp(min=0).long().view(B * S_q, topk)
+    valid_mask = (indices >= 0).view(B * S_q, topk)
 
-    # Gather: [B, S_q, topk, D_NOPE] / [B, S_q, topk, D_ROPE]
-    flat_idx = safe_idx.view(-1)
-    k_nope = flat_nope.index_select(0, flat_idx).view(B, S_q, topk, _V4_D_NOPE)
-    k_rope = flat_rope.index_select(0, flat_idx).view(B, S_q, topk, _V4_D_ROPE)
+    q_nope_flat = q[..., :_V4_D_NOPE].reshape(B * S_q, H_q, _V4_D_NOPE)
+    q_rope_flat = q[..., _V4_D_NOPE:_V4_D_QK].reshape(B * S_q, H_q, _V4_D_ROPE)
 
-    q_nope = q[..., :_V4_D_NOPE]  # [B, S_q, H_q, D_NOPE]
-    q_rope = q[..., _V4_D_NOPE:_V4_D_QK]  # [B, S_q, H_q, D_ROPE]
+    out_flat = torch.zeros(B * S_q, H_q, d_v, dtype=torch.bfloat16, device=q.device)
+    lse_flat = torch.zeros(B * S_q, H_q, dtype=torch.float32, device=q.device)
 
-    # QK^T in FP32 accum.
-    qk_nope = torch.einsum("bsHd,bstd->bsHt", q_nope.float(), k_nope.float())
-    qk_rope = torch.einsum("bsHd,bstd->bsHt", q_rope.float(), k_rope.float())
-    qk = (qk_nope + qk_rope) * float(sm_scale)  # [B, S_q, H_q, topk]
+    BS = B * S_q
+    CHUNK = 32 if BS > 32 else BS
 
-    # Mask invalid topk positions to -inf (so they go to 0 post-softmax).
-    mask = valid_mask.unsqueeze(2).expand(B, S_q, H_q, topk)
-    qk = qk.masked_fill(~mask, float("-inf"))
+    for start in range(0, BS, CHUNK):
+        end = min(BS, start + CHUNK)
+        chunk = end - start
+        chunk_idx = safe_idx[start:end].reshape(-1)  # [chunk*topk]
+        chunk_mask = valid_mask[start:end]  # [chunk, topk]
 
-    # In-kernel attn_sink fold: append one virtual logit per (b, s_q, h)
-    # with magnitude attn_sink[h] and zero value contribution. Softmax
-    # over (topk + 1) positions; the sink position contributes 0 to the
-    # weighted sum.
-    if attn_sink is not None:
-        assert attn_sink.shape == (H_q,) and attn_sink.dtype == torch.float32
-        sink_logits = attn_sink.view(1, 1, H_q, 1).expand(B, S_q, H_q, 1).to(qk.dtype)
-        qk_aug = torch.cat([qk, sink_logits], dim=-1)  # [B, S_q, H_q, topk+1]
-        m = qk_aug.amax(dim=-1, keepdim=True)
-        m = torch.where(torch.isinf(m) & (m < 0), torch.zeros_like(m), m)
-        e_aug = torch.exp(qk_aug - m)
-        sumexp = e_aug.sum(dim=-1, keepdim=True).clamp_min(
-            torch.finfo(torch.float32).tiny
-        )
-        weights = e_aug[..., :topk] / sumexp  # drop sink slot from V mix
-        lse = m.squeeze(-1) + torch.log(sumexp.squeeze(-1))
-    else:
-        m = qk.amax(dim=-1, keepdim=True)
-        m = torch.where(torch.isinf(m) & (m < 0), torch.zeros_like(m), m)
-        e = torch.exp(qk - m)
-        sumexp = e.sum(dim=-1, keepdim=True).clamp_min(torch.finfo(torch.float32).tiny)
-        weights = e / sumexp
-        lse = m.squeeze(-1) + torch.log(sumexp.squeeze(-1))
+        k_fp8_c = flat_fp8.index_select(0, chunk_idx)
+        k_rope_c = flat_rope.index_select(0, chunk_idx).view(chunk, topk, _V4_D_ROPE)
+        k_scales_c = flat_scales.index_select(0, chunk_idx)
 
-    # Out = weights @ K_nope (FP32 accum -> BF16). Trailing 64 dims of d_v
-    # are zero (K-NoPE is only 448 wide; the V4-Flash output contract
-    # requires width 512).
-    out_nope = torch.einsum(
-        "bsHt,bstd->bsHd", weights, k_nope.float()
-    )  # [B, S_q, H_q, 448]
-    out = q.new_zeros(B, S_q, H_q, d_v, dtype=torch.bfloat16)
-    out[..., :_V4_D_NOPE] = out_nope.to(torch.bfloat16)
+        nope_f32 = k_fp8_c.float()
+        scales_f32 = torch.exp2(k_scales_c.float() - _UE8M0_BIAS)
+        scales_expanded = scales_f32.repeat_interleave(_V4_QUANT_TILE_SIZE, dim=-1)
+        k_nope_bf16 = (nope_f32 * scales_expanded).to(torch.bfloat16)
+        del nope_f32, scales_expanded, scales_f32
+        k_nope_c = k_nope_bf16.view(chunk, topk, _V4_D_NOPE)
 
-    return out, lse.to(torch.float32)
+        q_nope_c = q_nope_flat[start:end]
+        q_rope_c = q_rope_flat[start:end]
+
+        qk_nope = torch.einsum("bHd,btd->bHt", q_nope_c.float(), k_nope_c.float())
+        qk_rope = torch.einsum("bHd,btd->bHt", q_rope_c.float(), k_rope_c.float())
+        qk = (qk_nope + qk_rope) * float(sm_scale)
+        del qk_nope, qk_rope
+
+        mask = chunk_mask.unsqueeze(1).expand(chunk, H_q, topk)
+        qk = qk.masked_fill(~mask, float("-inf"))
+
+        if attn_sink is not None:
+            assert attn_sink.shape == (H_q,) and attn_sink.dtype == torch.float32
+            sink_logits = attn_sink.view(1, H_q, 1).expand(chunk, H_q, 1).to(qk.dtype)
+            qk_aug = torch.cat([qk, sink_logits], dim=-1)
+            m = qk_aug.amax(dim=-1, keepdim=True)
+            m = torch.where(torch.isinf(m) & (m < 0), torch.zeros_like(m), m)
+            e_aug = torch.exp(qk_aug - m)
+            sumexp = e_aug.sum(dim=-1, keepdim=True).clamp_min(
+                torch.finfo(torch.float32).tiny
+            )
+            weights = e_aug[..., :topk] / sumexp
+            lse_chunk = m.squeeze(-1) + torch.log(sumexp.squeeze(-1))
+            del qk_aug, e_aug
+        else:
+            m = qk.amax(dim=-1, keepdim=True)
+            m = torch.where(torch.isinf(m) & (m < 0), torch.zeros_like(m), m)
+            e = torch.exp(qk - m)
+            sumexp = e.sum(dim=-1, keepdim=True).clamp_min(
+                torch.finfo(torch.float32).tiny
+            )
+            weights = e / sumexp
+            lse_chunk = m.squeeze(-1) + torch.log(sumexp.squeeze(-1))
+            del e
+
+        out_nope_c = torch.einsum("bHt,btd->bHd", weights, k_nope_c.float())
+        del weights, k_nope_c, k_rope_c, k_fp8_c, k_scales_c, k_nope_bf16
+
+        out_flat[start:end, :, :_V4_D_NOPE] = out_nope_c.to(torch.bfloat16)
+        lse_flat[start:end] = lse_chunk
+
+    out = out_flat.view(B, S_q, H_q, d_v)
+    lse = lse_flat.view(B, S_q, H_q)
+    return out, lse
 
 
 __all__ = ["eager_fp8_sparse_decode"]
