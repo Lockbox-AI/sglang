@@ -73,9 +73,71 @@ with optional ``attn_sink``: ``lse = lse + log1p(exp(attn_sink - lse))``
 
 from __future__ import annotations
 
+import logging
 from typing import Tuple
 
 import torch
+
+logger = logging.getLogger(__name__)
+
+
+_PROBE_COMBINE_CALLS = 0
+_PROBE_COMBINE_LIMIT = 4
+
+
+def _probe_log_combine_fold(
+    *,
+    lse_f32: torch.Tensor,
+    sink: torch.Tensor,
+    new_lse: torch.Tensor,
+    scale: torch.Tensor,
+) -> None:
+    """Log fold-site magnitudes for the first few combine calls.
+
+    Phase-5 / T5.2 diagnostic. Throttled per process via
+    ``_PROBE_COMBINE_LIMIT``. Output: per-head stats for ``lse`` (the
+    LSE returned by K2a, which is ``log(sum exp(qk * sm_scale))``),
+    ``sink`` (the trained per-head sink logit), the fold's LSE delta,
+    and the fold's output scaling factor. Used to reconcile the
+    apparent contradiction between the small mathematical fold
+    contribution and the empirical 2x accuracy lift when the fold is
+    disabled (T5.1).
+    """
+    global _PROBE_COMBINE_CALLS
+    if _PROBE_COMBINE_CALLS >= _PROBE_COMBINE_LIMIT:
+        return
+    _PROBE_COMBINE_CALLS += 1
+    try:
+        lse_flat = lse_f32.detach().flatten()
+        sink_flat = sink.detach().flatten()
+        scale_flat = scale.detach().flatten()
+        nl_flat = new_lse.detach().flatten()
+        delta_flat = (nl_flat - lse_flat).flatten()
+        logger.warning(
+            "[sm_120 phase-5 T5.2 fold-probe %d/%d] "
+            "lse: shape=%s mean=%.4f abs_mean=%.4f min=%.4f max=%.4f | "
+            "sink: shape=%s abs_mean=%.4f min=%.4f max=%.4f | "
+            "delta_lse: abs_mean=%.6f max=%.6f | "
+            "scale: abs_mean=%.6f min=%.6f max=%.6f",
+            _PROBE_COMBINE_CALLS,
+            _PROBE_COMBINE_LIMIT,
+            tuple(lse_f32.shape),
+            float(lse_flat.mean().item()),
+            float(lse_flat.abs().mean().item()),
+            float(lse_flat.min().item()),
+            float(lse_flat.max().item()),
+            tuple(sink.shape),
+            float(sink_flat.abs().mean().item()),
+            float(sink_flat.min().item()),
+            float(sink_flat.max().item()),
+            float(delta_flat.abs().mean().item()),
+            float(delta_flat.abs().max().item()),
+            float(scale_flat.abs().mean().item()),
+            float(scale_flat.min().item()),
+            float(scale_flat.max().item()),
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[sm_120 phase-5 T5.2 fold-probe] log failed: %r", e)
 
 
 def triton_combine_partials_sm120(
@@ -164,13 +226,24 @@ def triton_combine_partials_sm120(
     # Phase-5 / T5.1 diagnostic: ``SGLANG_SM120_DISABLE_ATTN_SINK=1``
     # bypasses the fold here. Used to A/B the sink contribution to the
     # post-T4.3 GSM8K residual gap; default OFF in production.
-    from sglang.srt.layers.sm120_diagnostic import disable_attn_sink
+    from sglang.srt.layers.sm120_diagnostic import disable_attn_sink, probe_attn_sink
 
     if attn_sink is not None and not disable_attn_sink():
         sink = attn_sink.to(torch.float32)
         # Broadcast sink [h_q] over [b, s_q, h_q]
         new_lse = lse_f32 + torch.nn.functional.softplus(sink - lse_f32)
         scale = torch.exp(lse_f32 - new_lse).unsqueeze(-1)  # [b, s_q, h_q, 1]
+
+        # Phase-5 / T5.2 fold-site probe. When SGLANG_SM120_PROBE_ATTN_SINK=1,
+        # log lse / sink / scale magnitudes for the first few combine calls
+        # so we can see whether the fold's mathematical contribution actually
+        # matches the empirical 2x accuracy lift observed when the fold is
+        # disabled.
+        if probe_attn_sink():
+            _probe_log_combine_fold(
+                lse_f32=lse_f32, sink=sink, new_lse=new_lse, scale=scale
+            )
+
         out_f32 = out_f32 * scale
         lse_f32 = new_lse
 
