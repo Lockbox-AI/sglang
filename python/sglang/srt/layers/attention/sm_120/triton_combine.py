@@ -218,27 +218,42 @@ def triton_combine_partials_sm120(
         sum_p.clamp_min(torch.finfo(torch.float32).tiny)
     )
 
-    # Fold attn_sink (per-head log-domain bias) — matches FlashMLA
-    # combine.cu:101-112. The sink is a virtual "extra token" with
-    # log-weight attn_sink[h] and zero value contribution; folding it in
-    # rescales the output by exp(lse - new_lse) and updates the lse.
+    # Fold attn_sink (per-head log-domain bias).
     #
-    # Phase-5 / T5.1 diagnostic: ``SGLANG_SM120_DISABLE_ATTN_SINK=1``
-    # bypasses the fold here. Used to A/B the sink contribution to the
-    # post-T4.3 GSM8K residual gap; default OFF in production.
+    # Mathematically this matches the sglang canonical sink-fold reference
+    # at ``triton_ops/decode_attention.py:574-576`` (and FlashMLA
+    # combine.cu:101-112): the sink is a virtual "extra token" with
+    # log-weight ``attn_sink[h]`` and zero value contribution; folding it
+    # in rescales the output by ``exp(lse - new_lse)`` and updates the
+    # LSE to ``log(exp(lse) + exp(sink))``. Default behaviour: fold ON.
+    #
+    # Phase-5 / T5.2 finding (see
+    # ``source-artifacts/.../sm120-fallback/phase-5/T5.2-ATTN-SINK-FOLD-STATUS.md``):
+    # the fold attenuates outputs by ``mean=0.65`` (and as low as 0.08 in
+    # extreme cases) on sm_120 V4-Flash because the K2a TileLang
+    # sparse-decode kernel emits a smaller-than-expected LSE distribution
+    # (mean=1.38, frequently 0.0) versus the trained sink magnitudes
+    # (abs_mean=0.65). The T5.1 GSM8K-200 result that suggested a 2x
+    # accuracy lift from disabling the fold did NOT reproduce on a
+    # confirmation run (3/200 -> 6/200 -> 3/200, mean lift +1/200,
+    # within sqrt(3)~1.7 Poisson noise). Combined with a worse invalid
+    # rate when the fold is disabled (+33%), the net production effect
+    # is negative. **The fold therefore stays ON by default**, matching
+    # the upstream sglang convention. T5.3 will pursue a higher-N
+    # statistical test and possibly probe whether the LSE distribution
+    # itself is the actual residual contributor.
+    #
+    # Diagnostic toggles preserved from T5.1 / T5.2 for future probing:
+    #   * ``SGLANG_SM120_DISABLE_ATTN_SINK=1`` bypasses the fold (T5.1).
+    #   * ``SGLANG_SM120_PROBE_ATTN_SINK=1`` logs lse / sink / scale
+    #     magnitudes at the fold site (T5.2).
     from sglang.srt.layers.sm120_diagnostic import disable_attn_sink, probe_attn_sink
 
     if attn_sink is not None and not disable_attn_sink():
         sink = attn_sink.to(torch.float32)
-        # Broadcast sink [h_q] over [b, s_q, h_q]
         new_lse = lse_f32 + torch.nn.functional.softplus(sink - lse_f32)
-        scale = torch.exp(lse_f32 - new_lse).unsqueeze(-1)  # [b, s_q, h_q, 1]
+        scale = torch.exp(lse_f32 - new_lse).unsqueeze(-1)
 
-        # Phase-5 / T5.2 fold-site probe. When SGLANG_SM120_PROBE_ATTN_SINK=1,
-        # log lse / sink / scale magnitudes for the first few combine calls
-        # so we can see whether the fold's mathematical contribution actually
-        # matches the empirical 2x accuracy lift observed when the fold is
-        # disabled.
         if probe_attn_sink():
             _probe_log_combine_fold(
                 lse_f32=lse_f32, sink=sink, new_lse=new_lse, scale=scale
