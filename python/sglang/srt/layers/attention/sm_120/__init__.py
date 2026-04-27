@@ -247,17 +247,40 @@ def tilelang_fp8_sparse_decode_sm120(
     from sglang.srt.layers.attention.sm_120.triton_combine import (
         triton_combine_partials_sm120,
     )
+    from sglang.srt.layers.sm120_diagnostic import eager_sparse_decode
+
+    # Phase-5 / T5.1 diagnostic: SGLANG_SM120_EAGER_SPARSE_DECODE=1 swaps
+    # the TileLang FP8 sparse-decode kernel for an eager BF16 reference
+    # that ALSO folds attn_sink in-kernel (so the post-hoc combine fold
+    # is bypassed for the eager rows). Used to A/B both K2a kernel
+    # correctness and the combine sink fold against the same oracle.
+    if eager_sparse_decode():
+        from sglang.srt.layers.attention.sm_120._eager_sparse_decode import (
+            eager_fp8_sparse_decode,
+        )
+
+        sparse_decode_fn = eager_fp8_sparse_decode
+        # Eager path applies attn_sink IN-KERNEL; pass None into combine
+        # so we don't double-fold.
+        sparse_decode_attn_sink_pass = attn_sink
+        combine_attn_sink_pass = None
+    else:
+        sparse_decode_fn = tilelang_fp8_sparse_decode
+        sparse_decode_attn_sink_pass = None
+        combine_attn_sink_pass = attn_sink
 
     # SWA / "primary" KV path (always present on the V4 sparse-decode path).
-    # The kernel itself ignores attn_sink; we fold it in during combine below.
-    out_swa, lse_swa = tilelang_fp8_sparse_decode(
+    # The TileLang kernel itself ignores attn_sink; we fold it in during
+    # combine below. The eager-reference kernel applies it in-kernel
+    # (see toggle above).
+    out_swa, lse_swa = sparse_decode_fn(
         q=q,
         kv_cache=k_cache,
         block_table=block_table,
         seq_lens=cache_seqlens,
         indices=indices,
         sm_scale=float(softmax_scale),
-        attn_sink=None,
+        attn_sink=sparse_decode_attn_sink_pass,
         is_fp8_kvcache=is_fp8_kvcache,
         h_kv=1,
         d_v=head_dim_v,
@@ -271,14 +294,14 @@ def tilelang_fp8_sparse_decode_sm120(
         # FlashMLA's split-KV pipeline: the per-SM-part decode kernel emits
         # partial (out, lse) tuples and the combine kernel merges them
         # (csrc/smxx/decode/combine/combine.cu).
-        out_extra, lse_extra = tilelang_fp8_sparse_decode(
+        out_extra, lse_extra = sparse_decode_fn(
             q=q,
             kv_cache=extra_k_cache,
             block_table=None,
             seq_lens=None,
             indices=extra_indices_in_kvcache,
             sm_scale=float(softmax_scale),
-            attn_sink=None,
+            attn_sink=sparse_decode_attn_sink_pass,
             is_fp8_kvcache=is_fp8_kvcache,
             h_kv=1,
             d_v=head_dim_v,
@@ -294,7 +317,7 @@ def tilelang_fp8_sparse_decode_sm120(
         return triton_combine_partials_sm120(
             partials_out=partials_out,
             partials_lse=partials_lse,
-            attn_sink=attn_sink,
+            attn_sink=combine_attn_sink_pass,
         )
 
     # Single-split path: still go through combine to apply attn_sink
@@ -305,7 +328,7 @@ def tilelang_fp8_sparse_decode_sm120(
     return triton_combine_partials_sm120(
         partials_out=partials_out,
         partials_lse=partials_lse,
-        attn_sink=attn_sink,
+        attn_sink=combine_attn_sink_pass,
     )
 
 

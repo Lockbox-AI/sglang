@@ -306,6 +306,31 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
         raise ValueError(f"Unknown FP8 GEMM backend: {backend}")
 
 
+def _maybe_eager_w8a8_block_sm120() -> Optional[Callable]:
+    """Phase-5 / T5.1 diagnostic.
+
+    Returns the eager BF16 reference for ``triton_w8a8_block_fp8_linear`` if
+    ``SGLANG_SM120_EAGER_W8A8_BLOCK=1`` and we are on sm_120. Otherwise
+    returns None and the auto/explicit dispatch falls through to the normal
+    path. Used to A/B the Triton W8A8 numerical drift contribution to the
+    post-T4.3 GSM8K residual gap.
+    """
+    if not _is_sm120():
+        return None
+    try:
+        from sglang.srt.layers.sm120_diagnostic import eager_w8a8_block
+
+        if not eager_w8a8_block():
+            return None
+        from sglang.srt.layers.quantization._eager_block_fp8_sm120 import (
+            eager_w8a8_block_fp8_linear_sm120,
+        )
+
+        return eager_w8a8_block_fp8_linear_sm120
+    except Exception:
+        return None
+
+
 def _dispatch_auto_backend() -> Callable:
     """Auto-select the best backend based on hardware capabilities."""
     # Priority order for auto selection:
@@ -321,6 +346,9 @@ def _dispatch_auto_backend() -> Callable:
     # 6. Triton (fallback)
 
     if _is_sm120():
+        eager = _maybe_eager_w8a8_block_sm120()
+        if eager is not None:
+            return eager
         return triton_w8a8_block_fp8_linear
     if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
         return deepgemm_w8a8_block_fp8_linear_with_fallback

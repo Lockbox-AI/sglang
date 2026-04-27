@@ -123,6 +123,56 @@ class TritonRunnerCore(MoeRunnerCore):
             swiglu_with_alpha_and_limit,
         )
 
+        # ----------------------------------------------------------------
+        # Phase-5 / T5.1 sm_120 diagnostic: SGLANG_SM120_EAGER_MOE_FP8=1
+        # short-circuits the production path with an eager per-expert
+        # BF16 MoE that block-dequantizes the FP8 weights on the fly.
+        # Used to A/B the Triton fused-MoE FP8 W8A8 block kernel's
+        # contribution to the post-T4.3 GSM8K residual gap.
+        # ----------------------------------------------------------------
+        if (
+            quant_info.use_fp8_w8a8
+            and not quant_info.use_int8_w8a8
+            and not quant_info.use_int8_w8a16
+            and not quant_info.use_int4_w4a16
+            and quant_info.block_shape is not None
+            and quant_info.w13_scale is not None
+            and quant_info.w2_scale is not None
+        ):
+            try:
+                from sglang.srt.layers.sm120_diagnostic import eager_moe_fp8
+
+                if eager_moe_fp8():
+                    from sglang.srt.layers.moe._eager_block_fp8_moe_sm120 import (
+                        eager_block_fp8_moe_sm120,
+                    )
+
+                    out = eager_block_fp8_moe_sm120(
+                        hidden_states=runner_input.hidden_states,
+                        w1=quant_info.w13_weight,
+                        w2=quant_info.w2_weight,
+                        topk_weights=runner_input.topk_weights,
+                        topk_ids=runner_input.topk_ids,
+                        w1_scale=quant_info.w13_scale,
+                        w2_scale=quant_info.w2_scale,
+                        block_shape=quant_info.block_shape,
+                        a1_scale=quant_info.a13_scale,
+                        a2_scale=quant_info.a2_scale,
+                        b1=quant_info.b13,
+                        b2=quant_info.b2,
+                    )
+                    return TritonRunnerOutput(hidden_states=out)
+            except Exception as e:
+                # Eager path is diagnostic-only; on failure, fall through to
+                # the production Triton kernel rather than crashing the run.
+                import logging
+
+                logging.getLogger(__name__).warning(
+                    "[sm_120 phase-5 diagnostic] eager_moe_fp8 path raised "
+                    "%r; falling back to Triton fused-MoE",
+                    e,
+                )
+
         hidden_states = runner_input.hidden_states
         topk_weights = runner_input.topk_weights
         topk_ids = runner_input.topk_ids

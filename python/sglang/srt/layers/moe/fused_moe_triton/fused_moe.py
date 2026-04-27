@@ -13,7 +13,9 @@ import torch
 import torch.nn.functional as F
 import triton.language as tl
 
-from sglang.srt.debug_utils.deepseek_v4_debug_utils import deepseek_v4_moe_code_path_checker
+from sglang.srt.debug_utils.deepseek_v4_debug_utils import (
+    deepseek_v4_moe_code_path_checker,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.utils import (
@@ -728,6 +730,45 @@ def fused_moe(
     Returns:
     - torch.Tensor: The output tensor after applying the MoE layer.
     """
+
+    # Phase-5 / T5.1 sm_120 diagnostic: SGLANG_SM120_EAGER_MOE_FP8=1
+    # swaps the Triton fused-MoE FP8 W8A8 block path for an eager
+    # per-expert BF16 reference (block-dequantize weights on the fly).
+    # Used only on sm_120 + the block-FP8 path (V4-Flash). See
+    # ``sglang.srt.layers.sm120_diagnostic`` for the toggle.
+    if (
+        use_fp8_w8a8
+        and not use_int8_w8a8
+        and not use_int8_w8a16
+        and not use_int4_w4a16
+        and block_shape is not None
+        and w1_scale is not None
+        and w2_scale is not None
+    ):
+        try:
+            from sglang.srt.layers.sm120_diagnostic import eager_moe_fp8
+
+            if eager_moe_fp8():
+                from sglang.srt.layers.moe._eager_block_fp8_moe_sm120 import (
+                    eager_block_fp8_moe_sm120,
+                )
+
+                return eager_block_fp8_moe_sm120(
+                    hidden_states=hidden_states,
+                    w1=w1,
+                    w2=w2,
+                    topk_weights=topk_output.topk_weights,
+                    topk_ids=topk_output.topk_ids,
+                    w1_scale=w1_scale,
+                    w2_scale=w2_scale,
+                    block_shape=block_shape,
+                    a1_scale=a1_scale,
+                    a2_scale=a2_scale,
+                    b1=b1,
+                    b2=b2,
+                )
+        except Exception:
+            pass
 
     return fused_experts(
         hidden_states,

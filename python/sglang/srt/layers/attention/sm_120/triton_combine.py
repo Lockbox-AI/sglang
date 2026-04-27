@@ -160,7 +160,13 @@ def triton_combine_partials_sm120(
     # combine.cu:101-112. The sink is a virtual "extra token" with
     # log-weight attn_sink[h] and zero value contribution; folding it in
     # rescales the output by exp(lse - new_lse) and updates the lse.
-    if attn_sink is not None:
+    #
+    # Phase-5 / T5.1 diagnostic: ``SGLANG_SM120_DISABLE_ATTN_SINK=1``
+    # bypasses the fold here. Used to A/B the sink contribution to the
+    # post-T4.3 GSM8K residual gap; default OFF in production.
+    from sglang.srt.layers.sm120_diagnostic import disable_attn_sink
+
+    if attn_sink is not None and not disable_attn_sink():
         sink = attn_sink.to(torch.float32)
         # Broadcast sink [h_q] over [b, s_q, h_q]
         new_lse = lse_f32 + torch.nn.functional.softplus(sink - lse_f32)
